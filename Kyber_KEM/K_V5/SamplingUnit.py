@@ -1,23 +1,25 @@
+from typing import List
 from .SymmetricCrypto import SymmetricCryptoEngine
-from .ArithmeticUnit import Poly
+
+Poly = List[int]
+
 
 class SamplingUnit:
     """Maps to filtering logic that parses byte streams into valid ring coefficients."""
-    
+
     def __init__(self, n: int, q: int, eta: int):
-        self.N = n
-        self.Q = q
+        self.N   = n
+        self.Q   = q
         self.ETA = eta
 
     def sample_uniform(self, seed: bytes, i: int, j: int) -> Poly:
-        """Rejection sampling logic. Implements variable-latency hardware loop."""
-        # Over-generate bytes to handle hardware streaming pipeline
-        stream = SymmetricCryptoEngine.xof_shake128(seed, i, j, 3 * self.N * 2 + 32)
+        """Rejection sampling — variable-latency hardware loop."""
+        stream = bytearray(SymmetricCryptoEngine.xof_shake128(seed, i, j, 3 * self.N * 2 + 32))
         result = []
         idx = 0
         while len(result) < self.N:
             if idx + 2 >= len(stream):
-                # Refill buffer constraint simulator
+                import hashlib
                 h2 = hashlib.shake_128()
                 h2.update(stream[-32:])
                 stream += h2.digest(3 * self.N)
@@ -32,16 +34,16 @@ class SamplingUnit:
         return result[:self.N]
 
     def sample_cbd(self, seed: bytes, nonce: int) -> Poly:
-        """Centered Binomial Distribution. Maps to bit-counting adder trees."""
+        """Centered Binomial Distribution — bit-counting adder trees."""
         num_bytes = ((2 * self.ETA * self.N) + 7) // 8
-        buf = SymmetricCryptoEngine.prf_shake256(seed, nonce, num_bytes)
+        buf  = SymmetricCryptoEngine.prf_shake256(seed, nonce, num_bytes)
         bits = []
         for byte in buf:
             for bit_pos in range(8):
                 bits.append((byte >> bit_pos) & 1)
         coeffs = []
         for i in range(self.N):
-            a = sum(bits[2 * self.ETA * i + j] for j in range(self.ETA))
+            a = sum(bits[2 * self.ETA * i + j]            for j in range(self.ETA))
             b = sum(bits[2 * self.ETA * i + self.ETA + j] for j in range(self.ETA))
             coeffs.append((a - b) % self.Q)
         return coeffs
