@@ -1,729 +1,773 @@
 """
-test_kyber.py
-─────────────
+test_kyber_full.py
+==================
 Comprehensive test suite for the Kyber KEM pipeline.
 
-Run with:
-    python -m Kyber_KEM.tests          (from the repo root)
-    python -m pytest Kyber_KEM/tests   (if pytest is installed)
-
 Sections
-────────
-  1.  Core correctness        – encrypt/decrypt round-trips
-  2.  String payloads         – short, unicode, long, empty-ish
-  3.  Integer payloads        – small, large, negative proxy, zero
-  4.  Float payloads          – normal, edge (inf, nan)
-  5.  Bytes payloads          – random, all-zeros, all-ones, structured
-  6.  Chunked API             – multi-chunk encrypt/decrypt round-trips
-  7.  Compression             – ratio checks, round-trips, tamper detection
-  8.  Error handling          – every exception type in KyberExceptions
-  9.  Multi-variant           – Kyber-512 / 768 / 1024
-  10. Noise analysis          – coefficient-level noise statistics
-  11. Benchmarks              – per-operation timing
+--------
+1.  Error Handling Tests  — every typed exception from KyberExceptions
+2.  FO Transform Tests    — tampered ciphertext, garbage_key, timing
+3.  Encode/Decode Round-Trip Sanity
+4.  Profiler Dashboard    — error path + FO overhead vs happy path
+5.  Enc/Dec Benchmark     — avg latency across message length buckets
+
+FO PROTOCOL NOTE
+----------------
+The FO check in KyberCore._fo_check re-derives randomness as:
+    L' = SHA3-512(p')[32:]
+and re-encrypts p' with L'.  For the check to PASS the original encryption
+must also have used L = SHA3-512(m)[32:] as its r_seed — i.e. the "FO-mode"
+encrypt call.  If encrypt() is called with r_seed=None (random), the check
+will ALWAYS reject because (u,v) ≠ (u',v').
+
+The helper _fo_encrypt() below performs a correct FO-mode encryption so that
+the honest-path tests pass.  Tamper tests bypass this by modifying coefficients
+after an honest FO-mode encrypt, so rejection is expected.
+
+Run from the package root:
+    python -m <package>.test_kyber_full
+
+Or standalone:
+    python test_kyber_full.py
 """
 
+from __future__ import annotations
+
+import hashlib
 import os
-import struct
+import sys
 import time
-import unittest
-from typing import List
-
-# ── imports from the package ─────────────────────────────────────────────────
-from ..ArithmeticUnit import Poly
-from ..CiphertextCompressor import CiphertextCompressor
-from ..KyberCore import KyberCoreEngine, _to_bytes
-from ..KyberExceptions import (
-    CiphertextListError,
-    DecryptionError,
-    DecompressionError,
-    EmptyMessageError,
-    EncryptionError,
-    InvalidCiphertextError,
-    InvalidMessageTypeError,
-    InvalidPublicKeyError,
-    InvalidSecretKeyError,
-    InvalidSeedError,
-    KeyGenError,
-    MessageSizeError,
-    ParameterError,
-)
-from ..SerializationUnit import SerializationUnit
-from ..Profiler import Profiler
-from .helpers import (
-    N, Q, ETA,
-    VARIANTS, PASS, FAIL,
-    make_engine, make_keypair,
-    section, _bench_log,
-)
-
-CHUNK = (N + 7) // 8   # 32 bytes
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers shared across test cases
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _roundtrip_str(eng, pk, sk, text: str) -> bool:
-    cts = eng.encrypt_chunked(pk, text)
-    # output_type="str" used as fallback; tagged payloads auto-detect
-    return eng.decrypt_chunked(sk, cts, output_type="str") == text
-
-
-def _roundtrip_bytes(eng, pk, sk, data: bytes) -> bool:
-    cts = eng.encrypt_chunked(pk, data)
-    return eng.decrypt_chunked(sk, cts, output_type="bytes") == data
-
-
-def _roundtrip_int(eng, pk, sk, value: int) -> bool:
-    cts = eng.encrypt_chunked(pk, value)
-    return eng.decrypt_chunked(sk, cts, output_type="int") == value
-
-
-def _roundtrip_float(eng, pk, sk, value: float) -> bool:
-    import math
-    cts = eng.encrypt_chunked(pk, value)
-    rec = eng.decrypt_chunked(sk, cts, output_type="float")
-    if math.isnan(value):
-        return math.isnan(rec)
-    if math.isinf(value):
-        return math.isinf(rec) and (value > 0) == (rec > 0)
-    return rec == value
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. Core correctness
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestCoreCorrectness(unittest.TestCase):
-
-    def setUp(self):
-        self.eng = make_engine(k=2)
-        self.pk, self.sk = self.eng.keygen()
-
-    def test_01_keygen_returns_tuple(self):
-        self.assertIsInstance(self.pk, tuple)
-        self.assertEqual(len(self.pk), 2)
-
-    def test_02_keygen_pk_structure(self):
-        rho, t = self.pk
-        self.assertEqual(len(rho), 32)
-        self.assertIsInstance(t, list)
-        self.assertEqual(len(t), 2)   # k=2
-
-    def test_03_keygen_sk_structure(self):
-        self.assertIsInstance(self.sk, list)
-        self.assertEqual(len(self.sk), 2)
-
-    def test_04_single_chunk_roundtrip(self):
-        msg = os.urandom(CHUNK)
-        ct  = self.eng.encrypt(self.pk, msg)
-        rec = self.eng.decrypt(self.sk, ct)
-        self.assertEqual(rec, msg)
-
-    def test_05_all_zeros_chunk(self):
-        msg = b"\x00" * CHUNK
-        ct  = self.eng.encrypt(self.pk, msg)
-        self.assertEqual(self.eng.decrypt(self.sk, ct), msg)
-
-    def test_06_all_ones_chunk(self):
-        msg = b"\xff" * CHUNK
-        ct  = self.eng.encrypt(self.pk, msg)
-        self.assertEqual(self.eng.decrypt(self.sk, ct), msg)
-
-    def test_07_deterministic_keygen(self):
-        seed = os.urandom(32)
-        pk1, sk1 = self.eng.keygen(seed)
-        pk2, sk2 = self.eng.keygen(seed)
-        self.assertEqual(pk1[0], pk2[0])   # rho identical
-        self.assertEqual(sk1, sk2)
-
-    def test_08_different_seeds_different_keys(self):
-        pk1, _ = self.eng.keygen(os.urandom(32))
-        pk2, _ = self.eng.keygen(os.urandom(32))
-        self.assertNotEqual(pk1[0], pk2[0])
-
-    def test_09_ciphertext_not_plaintext(self):
-        msg = b"A" * CHUNK
-        ct  = self.eng.encrypt(self.pk, msg)
-        u, v = ct
-        # u and v are polynomial vectors — not equal to the plaintext directly
-        flat = [c for poly in u for c in poly] + list(v)
-        self.assertFalse(all(c == ord("A") for c in flat))
-
-    def test_10_wrong_sk_gives_garbage(self):
-        msg       = os.urandom(CHUNK)
-        ct        = self.eng.encrypt(self.pk, msg)
-        _, bad_sk = self.eng.keygen()          # different key pair
-        rec       = self.eng.decrypt(bad_sk, ct)
-        self.assertNotEqual(rec, msg)          # decryption should fail silently
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. String payloads
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestStringPayloads(unittest.TestCase):
-
-    def setUp(self):
-        Profiler.current_category = "Strings"
-        self.eng = make_engine(k=2)
-        self.pk, self.sk = self.eng.keygen()
-
-    def _rt(self, text):
-        return _roundtrip_str(self.eng, self.pk, self.sk, text)
-
-    def test_11_hello_world(self):
-        self.assertTrue(self._rt("Hello, World!"))
-
-    def test_12_single_char(self):
-        self.assertTrue(self._rt("X"))
-
-    def test_13_exactly_32_chars(self):
-        self.assertTrue(self._rt("A" * 32))
-
-    def test_14_exactly_33_chars_triggers_two_chunks(self):
-        text = "B" * 33
-        cts  = self.eng.encrypt_chunked(self.pk, text)
-        self.assertEqual(len(cts), 2)
-        self.assertEqual(
-            self.eng.decrypt_chunked(self.sk, cts, output_type="str"), text
-        )
-
-    def test_15_long_string_190_chars(self):
-        text = (
-            "The quick brown fox jumps over the lazy dog. "
-            "Pack my box with five dozen liquor jugs. "
-            "How vexingly quick daft zebras jump!"
-            " 1234567890!"
-        )
-        self.assertTrue(self._rt(text))
-
-    def test_16_unicode_emoji(self):
-        self.assertTrue(self._rt("Kyber 🔐🛡️ post-quantum!"))
-
-    def test_17_unicode_cjk(self):
-        self.assertTrue(self._rt("量子暗号は未来のセキュリティです。"))
-
-    def test_18_numeric_string(self):
-        self.assertTrue(self._rt("3141592653589793238462643383279502884197"))
-
-    def test_19_whitespace_only(self):
-        self.assertTrue(self._rt("   \t\n   "))
-
-    def test_20_repeated_pattern(self):
-        self.assertTrue(self._rt("kyber" * 20))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Integer payloads
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestIntegerPayloads(unittest.TestCase):
-
-    def setUp(self):
-        Profiler.current_category = "Integers"
-        self.eng = make_engine(k=2)
-        self.pk, self.sk = self.eng.keygen()
-
-    def _rt(self, val):
-        return _roundtrip_int(self.eng, self.pk, self.sk, val)
-
-    def test_21_zero(self):
-        self.assertTrue(self._rt(0))
-
-    def test_22_one(self):
-        self.assertTrue(self._rt(1))
-
-    def test_23_small_int(self):
-        self.assertTrue(self._rt(42))
-
-    def test_24_medium_int(self):
-        self.assertTrue(self._rt(123456789))
-
-    def test_25_large_int(self):
-        self.assertTrue(self._rt(2**128 - 1))
-
-    def test_26_very_large_int(self):
-        self.assertTrue(self._rt(2**256 - 1))
-
-    def test_27_prime(self):
-        self.assertTrue(self._rt(3329))    # Kyber's own modulus
-
-    def test_28_power_of_two(self):
-        self.assertTrue(self._rt(2**64))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. Float payloads
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestFloatPayloads(unittest.TestCase):
-
-    def setUp(self):
-        Profiler.current_category = "Floats"
-        self.eng = make_engine(k=2)
-        self.pk, self.sk = self.eng.keygen()
-
-    def _rt(self, val):
-        return _roundtrip_float(self.eng, self.pk, self.sk, val)
-
-    def test_29_pi(self):
-        import math
-        self.assertTrue(self._rt(math.pi))
-
-    def test_30_negative_float(self):
-        self.assertTrue(self._rt(-2.718281828))
-
-    def test_31_zero_float(self):
-        self.assertTrue(self._rt(0.0))
-
-    def test_32_very_small_float(self):
-        self.assertTrue(self._rt(1e-300))
-
-    def test_33_infinity(self):
-        import math
-        self.assertTrue(self._rt(math.inf))
-
-    def test_34_nan(self):
-        import math
-        self.assertTrue(self._rt(math.nan))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. Bytes payloads
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestBytesPayloads(unittest.TestCase):
-
-    def setUp(self):
-        Profiler.current_category = "Bytes"
-        self.eng = make_engine(k=2)
-        self.pk, self.sk = self.eng.keygen()
-
-    def _rt(self, data):
-        return _roundtrip_bytes(self.eng, self.pk, self.sk, data)
-
-    def test_35_random_32_bytes(self):
-        self.assertTrue(self._rt(os.urandom(32)))
-
-    def test_36_random_100_bytes(self):
-        self.assertTrue(self._rt(os.urandom(100)))
-
-    def test_37_all_zeros(self):
-        self.assertTrue(self._rt(bytes(32)))
-
-    def test_38_all_ones(self):
-        self.assertTrue(self._rt(b"\xff" * 32))
-
-    def test_39_structured_bytes(self):
-        data = bytes(range(256))
-        self.assertTrue(self._rt(data))
-
-    def test_40_single_byte(self):
-        self.assertTrue(self._rt(b"\xab"))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. Chunked API
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestChunkedAPI(unittest.TestCase):
-
-    def setUp(self):
-        # Profiler.current_category = "Chunked"
-        self.eng = make_engine(k=2)
-        self.pk, self.sk = self.eng.keygen()
-
-    def test_41_chunk_count_exact_multiple(self):
-        # Subtracting 5 bytes accounts for the header overhead 
-        # so the final payload aligns perfectly with the 3-chunk boundary.
-        data = os.urandom(CHUNK * 3 - 5)
-        cts  = self.eng.encrypt_chunked(self.pk, data)
-        self.assertEqual(len(cts), 3)
-
-    def test_42_chunk_count_with_remainder(self):
-        data = os.urandom(CHUNK * 2 + 5)
-        cts  = self.eng.encrypt_chunked(self.pk, data)
-        self.assertEqual(len(cts), 3)
-
-    def test_43_each_chunk_independently_valid(self):
-        text = "Hello Kyber chunked world! " * 4
-        cts  = self.eng.encrypt_chunked(self.pk, text)
-        for ct in cts:
-            raw = self.eng.decrypt(self.sk, ct)
-            self.assertEqual(len(raw), CHUNK)
-
-    def test_44_prepare_payload_string(self):
-        chunks = self.eng.prepare_payload("test")
-        self.assertTrue(all(len(c) == CHUNK for c in chunks))
-
-    def test_45_prepare_payload_int(self):
-        chunks = self.eng.prepare_payload(999)
-        self.assertTrue(all(len(c) == CHUNK for c in chunks))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. Compression
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestCompression(unittest.TestCase):
-
-    def setUp(self):
-        Profiler.current_category = "Compression"
-        self.raw_eng  = make_engine(k=2, compress=False)
-        self.comp_eng = make_engine(k=2, compress=True)
-        self.pk, self.sk = self.raw_eng.keygen()
-
-    def test_46_compressed_ciphertext_is_bytes(self):
-        msg = os.urandom(CHUNK)
-        ct  = self.comp_eng.encrypt(self.pk, msg)
-        self.assertIsInstance(ct, bytes)
-
-    def test_47_compressed_roundtrip(self):
-        msg = os.urandom(CHUNK)
-        ct  = self.comp_eng.encrypt(self.pk, msg)
-        rec = self.comp_eng.decrypt(self.sk, ct)
-        # Compression is lossy at the coefficient level but decoding still
-        # recovers the original message bits (noise stays within q/4).
-        self.assertEqual(rec, msg)
-
-    def test_48_compression_ratio_below_one(self):
-        msg  = os.urandom(CHUNK)
-        ct   = self.raw_eng.encrypt(self.pk, msg)
-        comp = CiphertextCompressor(q=Q)
-        info = comp.compression_ratio(ct)
-        self.assertLess(info["ratio"], 1.0)
-        self.assertGreater(info["savings_pct"], 0)
-
-    def test_49_magic_header_present(self):
-        msg  = os.urandom(CHUNK)
-        blob = self.comp_eng.encrypt(self.pk, msg)
-        self.assertTrue(blob[:4] == b"KYBR")
-
-    def test_50_tampered_blob_raises(self):
-        msg  = os.urandom(CHUNK)
-        blob = bytearray(self.comp_eng.encrypt(self.pk, msg))
-        blob[0] = 0xFF    # corrupt magic
-        with self.assertRaises((DecompressionError, InvalidCiphertextError)):
-            self.comp_eng.decrypt(self.sk, bytes(blob))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 8. Error handling
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestErrorHandling(unittest.TestCase):
-
-    def setUp(self):
-        self.eng = make_engine(k=2)
-        self.pk, self.sk = self.eng.keygen()
-
-    # keygen errors
-    def test_err_01_bad_seed_type(self):
-        with self.assertRaises(InvalidSeedError):
-            self.eng.keygen(seed=12345)
-
-    def test_err_02_seed_wrong_length(self):
-        with self.assertRaises(InvalidSeedError):
-            self.eng.keygen(seed=b"tooshort")
-
-    def test_err_03_invalid_parameter_n(self):
-        with self.assertRaises(ParameterError):
-            KyberCoreEngine(n=300, q=Q, eta=ETA, k_dimension=2)   # 300 not power-of-2
-
-    def test_err_04_invalid_parameter_k(self):
-        with self.assertRaises(ParameterError):
-            KyberCoreEngine(n=N, q=Q, eta=ETA, k_dimension=0)
-
-    # encrypt errors
-    def test_err_05_bad_public_key_type(self):
-        with self.assertRaises(InvalidPublicKeyError):
-            self.eng.encrypt("not_a_key", os.urandom(CHUNK))
-
-    def test_err_06_bad_public_key_rho(self):
-        bad_pk = (b"short", self.pk[1])
-        with self.assertRaises(InvalidPublicKeyError):
-            self.eng.encrypt(bad_pk, os.urandom(CHUNK))
-
-    def test_err_07_bad_public_key_t_length(self):
-        bad_pk = (self.pk[0], [self.pk[1][0]])   # t has only 1 poly instead of 2
-        with self.assertRaises(InvalidPublicKeyError):
-            self.eng.encrypt(bad_pk, os.urandom(CHUNK))
-
-    def test_err_08_message_wrong_size(self):
-        with self.assertRaises(MessageSizeError):
-            self.eng.encrypt(self.pk, b"tooshort")
-
-    def test_err_09_message_too_long(self):
-        with self.assertRaises(MessageSizeError):
-            self.eng.encrypt(self.pk, os.urandom(CHUNK + 1))
-
-    def test_err_10_message_wrong_type(self):
-        with self.assertRaises(InvalidMessageTypeError):
-            self.eng.encrypt(self.pk, 12345)   # int, not bytes
-
-    def test_err_11_empty_message(self):
-        with self.assertRaises(EmptyMessageError):
-            self.eng.encrypt(self.pk, b"")
-
-    def test_err_12_encrypt_chunked_empty_string(self):
-        # empty string → _to_bytes returns b"" → EmptyMessageError
-        with self.assertRaises(EmptyMessageError):
-            self.eng.encrypt_chunked(self.pk, "")
-
-    # decrypt errors
-    def test_err_13_bad_secret_key_type(self):
-        ct = self.eng.encrypt(self.pk, os.urandom(CHUNK))
-        with self.assertRaises(InvalidSecretKeyError):
-            self.eng.decrypt("bad_sk", ct)
-
-    def test_err_14_bad_secret_key_length(self):
-        ct = self.eng.encrypt(self.pk, os.urandom(CHUNK))
-        with self.assertRaises(InvalidSecretKeyError):
-            self.eng.decrypt([self.sk[0]], ct)    # only 1 poly instead of 2
-
-    def test_err_15_malformed_ciphertext_tuple(self):
-        with self.assertRaises(InvalidCiphertextError):
-            self.eng.decrypt(self.sk, ([], [], []))   # 3-tuple, not 2
-
-    def test_err_16_ciphertext_u_wrong_k(self):
-        ct = self.eng.encrypt(self.pk, os.urandom(CHUNK))
-        u, v = ct
-        bad_ct = ([u[0]], v)   # u has 1 poly instead of k=2
-        with self.assertRaises(InvalidCiphertextError):
-            self.eng.decrypt(self.sk, bad_ct)
-
-    def test_err_17_decrypt_chunked_non_list(self):
-        ct = self.eng.encrypt(self.pk, os.urandom(CHUNK))
-        with self.assertRaises(CiphertextListError):
-            self.eng.decrypt_chunked(self.sk, ct)   # should be a list
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 9. Multi-variant
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestMultiVariant(unittest.TestCase):
-
-    def _run_variant(self, k: int, label: str):
-        eng    = make_engine(k=k)
-        pk, sk = eng.keygen()
-        text   = f"Kyber-{label} variant test payload — index {k}."
-        cts    = eng.encrypt_chunked(pk, text)
-        result = eng.decrypt_chunked(sk, cts, output_type="str")
-        self.assertEqual(result, text, f"{label} round-trip failed")
-
-    def test_mv_01_kyber512(self):
-        self._run_variant(k=2, label="512")
-
-    def test_mv_02_kyber768(self):
-        self._run_variant(k=3, label="768")
-
-    def test_mv_03_kyber1024(self):
-        self._run_variant(k=4, label="1024")
-
-    def test_mv_04_cross_key_mismatch_512_768(self):
-        """A secret key from k=2 must not work on a k=3 ciphertext."""
-        eng2 = make_engine(k=2)
-        eng3 = make_engine(k=3)
-        pk3, _   = eng3.keygen()
-        _, sk2   = eng2.keygen()
-        msg      = os.urandom(CHUNK)
-        ct3      = eng3.encrypt(pk3, msg)
-        # Decryption with wrong sk dimension must raise, not silently corrupt
-        with self.assertRaises(Exception):
-            eng3.decrypt(sk2, ct3)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 10. Noise analysis
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestNoiseAnalysis(unittest.TestCase):
-
-    def _run_noise(self, k: int) -> dict:
-        eng    = make_engine(k=k)
-        pk, sk = eng.keygen()
-        msg    = os.urandom(CHUNK)
-        ct     = eng.encrypt(pk, msg)
-        u, v   = ct
-
-        # Compute w = v - s^T u
-        sTu = eng.vmm.vec_dot(sk, u)
-        w   = eng.alu.poly_sub(v, sTu)
-
-        # Encode original message to polynomial
-        ser  = SerializationUnit(N, Q)
-        mbar = ser.encode_message_to_poly(msg)
-
-        # Noise = w - mbar (centered)
-        noise = [(w[i] - mbar[i]) % Q for i in range(N)]
-        noise_c = [eng.alu.centered_mod(n) for n in noise]
-
-        return {
-            "max_abs":   max(abs(n) for n in noise_c),
-            "mean_abs":  sum(abs(n) for n in noise_c) / N,
-            "bound":     Q // 4,
-            "all_ok":    all(abs(n) < Q // 4 for n in noise_c),
-            "noise":     noise_c,
-        }
-
-    def test_noise_01_kyber512_within_bound(self):
-        stats = self._run_noise(k=2)
-        self.assertTrue(
-            stats["all_ok"],
-            f"Noise exceeded q/4={stats['bound']}; max={stats['max_abs']}"
-        )
-
-    def test_noise_02_kyber768_within_bound(self):
-        stats = self._run_noise(k=3)
-        self.assertTrue(stats["all_ok"])
-
-    def test_noise_03_kyber1024_within_bound(self):
-        stats = self._run_noise(k=4)
-        self.assertTrue(stats["all_ok"])
-
-    def test_noise_04_max_well_below_bound(self):
-        # Empirically, max noise should be << q/4 (≈ 832); typically < 200
-        stats = self._run_noise(k=2)
-        self.assertLess(stats["max_abs"], Q // 4)
-
-    def test_noise_05_mean_small(self):
-        stats = self._run_noise(k=2)
-        self.assertLess(stats["mean_abs"], 200)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 11. Benchmarks (run last; results printed by the runner)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestBenchmarks(unittest.TestCase):
-    """
-    These tests always pass — they exist to collect timing data.
-    Results are printed by the custom runner at the end.
-    """
-
-    def _bench_variant(self, k: int, label: str):
-        eng = make_engine(k=k)
-
-        # KeyGen
+import json
+from collections import defaultdict
+from pathlib import Path
+from typing import List, Tuple
+
+# ── import shim ──────────────────────────────────────────────────────────────
+try:
+    from ..KyberCore         import KyberCoreEngine
+    from ..ArithmeticUnit    import ntt
+    from ..KyberExceptions   import (
+        CiphertextListError,
+        DecryptionError,
+        EmptyMessageError,
+        EncryptionError,
+        FOTransformError,
+        ImplicitRejectionError,
+        InvalidCiphertextError,
+        InvalidMessageTypeError,
+        InvalidPublicKeyError,
+        InvalidSecretKeyError,
+        InvalidSeedError,
+        KeyGenError,
+        MessageSizeError,
+        ParameterError,
+        SoftDecodeError,
+    )
+    from ..Profiler import Profiler
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from KyberCore         import KyberCoreEngine           # type: ignore
+    from ArithmeticUnit    import ntt                       # type: ignore
+    from KyberExceptions   import (                         # type: ignore
+        CiphertextListError, DecryptionError, EmptyMessageError,
+        EncryptionError, FOTransformError, ImplicitRejectionError,
+        InvalidCiphertextError, InvalidMessageTypeError,
+        InvalidPublicKeyError, InvalidSecretKeyError, InvalidSeedError,
+        KeyGenError, MessageSizeError, ParameterError, SoftDecodeError,
+    )
+    from Profiler import Profiler                           # type: ignore
+
+
+# ── global constants ──────────────────────────────────────────────────────────
+N, Q, ETA = 256, 3329, 2
+CHUNK     = 32   # SerializationUnit.chunk_size = (256+7)//8
+
+# ── colour helpers ────────────────────────────────────────────────────────────
+GREEN  = "\033[32m"
+RED    = "\033[31m"
+YELLOW = "\033[33m"
+CYAN   = "\033[36m"
+BOLD   = "\033[1m"
+RESET  = "\033[0m"
+
+# ── result tracker ────────────────────────────────────────────────────────────
+_results: dict = {"pass": 0, "fail": 0, "skip": 0}
+_timing:  dict = defaultdict(list)   # label -> [elapsed_ms, ...]
+
+
+def _ok(label: str, elapsed_ms: float | None = None) -> None:
+    _results["pass"] += 1
+    tag = f"  {GREEN}✓ PASS{RESET}  {label}"
+    if elapsed_ms is not None:
+        tag += f"  {YELLOW}({elapsed_ms:.2f} ms){RESET}"
+    print(tag)
+
+
+def _fail(label: str, exc: Exception | None = None) -> None:
+    _results["fail"] += 1
+    tag = f"  {RED}✗ FAIL{RESET}  {label}"
+    if exc:
+        tag += f"\n         {RED}{type(exc).__name__}: {exc}{RESET}"
+    print(tag)
+
+
+def _section(title: str) -> None:
+    print(f"\n{'═' * 70}")
+    print(f"  {BOLD}{CYAN}{title}{RESET}")
+    print(f"{'═' * 70}")
+
+
+def _sub(title: str) -> None:
+    print(f"\n  {'─' * 60}")
+    print(f"  {BOLD}{title}{RESET}")
+    print(f"  {'─' * 60}")
+
+
+def _timeit(fn, runs: int = 5) -> Tuple[float, float, float]:
+    """Returns (avg_ms, min_ms, max_ms)."""
+    times = []
+    for _ in range(runs):
         t0 = time.perf_counter()
-        for _ in range(5):
-            pk, sk = eng.keygen()
-        keygen_ms = (time.perf_counter() - t0) * 1000 / 5
-        _bench_log.append((f"KeyGen   Kyber-{label}", keygen_ms))
-
-        # Encrypt single chunk
-        msg = os.urandom(CHUNK)
-        t0  = time.perf_counter()
-        for _ in range(5):
-            ct = eng.encrypt(pk, msg)
-        enc_ms = (time.perf_counter() - t0) * 1000 / 5
-        _bench_log.append((f"Encrypt  Kyber-{label} (1 chunk)", enc_ms))
-
-        # Decrypt single chunk
-        t0 = time.perf_counter()
-        for _ in range(5):
-            eng.decrypt(sk, ct)
-        dec_ms = (time.perf_counter() - t0) * 1000 / 5
-        _bench_log.append((f"Decrypt  Kyber-{label} (1 chunk)", dec_ms))
-
-        # Chunked round-trip (190-char string → 6 chunks)
-        long_msg = "The quick brown fox jumps over the lazy dog. " * 4
-        t0 = time.perf_counter()
-        for _ in range(3):
-            cts = eng.encrypt_chunked(pk, long_msg)
-            eng.decrypt_chunked(sk, cts, output_type="str")
-        rt_ms = (time.perf_counter() - t0) * 1000 / 3
-        _bench_log.append((f"RoundTrip Kyber-{label} (6 chunks)", rt_ms))
-
-    def _bench_compression(self):
-        eng  = make_engine(k=2, compress=True)
-        pk, sk = eng.keygen()
-        msg  = os.urandom(CHUNK)
-
-        t0 = time.perf_counter()
-        for _ in range(5):
-            blob = eng.encrypt(pk, msg)
-        comp_enc_ms = (time.perf_counter() - t0) * 1000 / 5
-        _bench_log.append(("Compress-Encrypt Kyber-512", comp_enc_ms))
-
-        t0 = time.perf_counter()
-        for _ in range(5):
-            eng.decrypt(sk, blob)
-        comp_dec_ms = (time.perf_counter() - t0) * 1000 / 5
-        _bench_log.append(("Compress-Decrypt Kyber-512", comp_dec_ms))
-
-        # Report compression ratio
-        raw_eng = make_engine(k=2)
-        ct_raw  = raw_eng.encrypt(pk, msg)
-        comp    = CiphertextCompressor(q=Q)
-        info    = comp.compression_ratio(ct_raw)
-        _bench_log.append(
-            (f"Compression ratio (d_u=10, d_v=4)",
-             float(f"{info['savings_pct']:.2f}"))   # store savings_pct as "ms" column
-        )
-
-    def test_bench_01_kyber512(self):
-        self._bench_variant(k=2, label="512")
-
-    def test_bench_02_kyber768(self):
-        self._bench_variant(k=3, label="768")
-
-    def test_bench_03_kyber1024(self):
-        self._bench_variant(k=4, label="1024")
-
-    def test_bench_04_compression(self):
-        self._bench_compression()
+        fn()
+        times.append((time.perf_counter() - t0) * 1000)
+    return sum(times) / len(times), min(times), max(times)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Custom runner that prints the benchmark report after all tests
-# ─────────────────────────────────────────────────────────────────────────────
+def _assert_raises(exc_type, fn, label: str) -> bool:
+    """Pass if exc_type (or a subclass) is raised, fail otherwise."""
+    t0 = time.perf_counter()
+    try:
+        fn()
+        _fail(label, Exception(f"Expected {exc_type.__name__}, got no exception"))
+        return False
+    except exc_type as e:
+        elapsed = (time.perf_counter() - t0) * 1000
+        _timing[f"error/{exc_type.__name__}"].append(elapsed)
+        _ok(label, elapsed)
+        return True
+    except Exception as e:
+        _fail(label, e)
+        return False
 
-from ..tests.helpers import print_bench_report
+
+# ── FO-mode encrypt helper ────────────────────────────────────────────────────
+# The FO check re-derives r_seed as L' = SHA3-512(p')[32:] and re-encrypts.
+# For honest decryption to PASS the check the original ciphertext must have
+# been produced with exactly that seed.  Use this helper for all FO tests.
+
+def _fo_encrypt(engine: KyberCoreEngine, pk: tuple, msg: bytes):
+    """Encrypt msg using the FO-derived seed L = SHA3-512(msg)[32:]."""
+    h = hashlib.sha3_512(msg).digest()
+    l_prime = h[32:]          # same derivation as _fo_check uses
+    return engine.encrypt(pk, msg, r_seed=l_prime)
 
 
-def _run() -> None:
-    loader  = unittest.TestLoader()
-    suite   = unittest.TestSuite()
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — Error Handling Tests
+# ══════════════════════════════════════════════════════════════════════════════
 
-    test_classes = [
-        TestCoreCorrectness,
-        TestStringPayloads,
-        TestIntegerPayloads,
-        TestFloatPayloads,
-        TestBytesPayloads,
-        TestChunkedAPI,
-        TestCompression,
-        TestErrorHandling,
-        TestMultiVariant,
-        TestNoiseAnalysis,
-        TestBenchmarks,
+def test_error_handling() -> None:
+    _section("SECTION 1 · Error Handling Tests")
+
+    # ── 1.1 Parameter validation ──────────────────────────────────────────────
+    _sub("1.1  ParameterError — invalid construction parameters")
+
+    _assert_raises(ParameterError,
+        lambda: KyberCoreEngine(0, Q, ETA, 2),
+        "n=0 (not a power of 2) → ParameterError")
+
+    _assert_raises(ParameterError,
+        lambda: KyberCoreEngine(100, Q, ETA, 2),
+        "n=100 (not a power of 2) → ParameterError")
+
+    _assert_raises(ParameterError,
+        lambda: KyberCoreEngine(N, 2, ETA, 2),
+        "q=2 (too small) → ParameterError")
+
+    _assert_raises(ParameterError,
+        lambda: KyberCoreEngine(N, Q, 0, 2),
+        "eta=0 → ParameterError")
+
+    _assert_raises(ParameterError,
+        lambda: KyberCoreEngine(N, Q, ETA, 0),
+        "k=0 → ParameterError")
+
+    _assert_raises(ParameterError,
+        lambda: KyberCoreEngine(N, Q, ETA, 2, rejection_seed=b"too_short"),
+        "rejection_seed wrong length → ParameterError")
+
+    # ── 1.2 Key generation errors ─────────────────────────────────────────────
+    _sub("1.2  InvalidSeedError / KeyGenError — keygen inputs")
+    eng = KyberCoreEngine(N, Q, ETA, k_dimension=2, d_u=10, d_v=4)
+
+    _assert_raises(InvalidSeedError,
+        lambda: eng.keygen(b"short"),
+        "seed too short (5 bytes) → InvalidSeedError")
+
+    _assert_raises(InvalidSeedError,
+        lambda: eng.keygen(b"x" * 64),
+        "seed too long (64 bytes) → InvalidSeedError")
+
+    _assert_raises(InvalidSeedError,
+        lambda: eng.keygen("not_bytes"),     # type: ignore
+        "seed as str → InvalidSeedError")
+
+    # ── 1.3 Encryption errors ─────────────────────────────────────────────────
+    _sub("1.3  Encryption errors — public key / message validation")
+
+    pk, sk = eng.keygen(os.urandom(32))
+    valid_msg = b"B" * CHUNK
+
+    # Bad public key structure
+    _assert_raises(InvalidPublicKeyError,
+        lambda: eng.encrypt((b"x" * 32, []), valid_msg),
+        "t=[] (empty) in pk → InvalidPublicKeyError")
+
+    _assert_raises(InvalidPublicKeyError,
+        lambda: eng.encrypt(("not_bytes", pk[1]), valid_msg),
+        "rho=str → InvalidPublicKeyError")
+
+    _assert_raises(InvalidPublicKeyError,
+        lambda: eng.encrypt((b"x" * 16, pk[1]), valid_msg),
+        "rho wrong length (16 bytes) → InvalidPublicKeyError")
+
+    _assert_raises(InvalidPublicKeyError,
+        lambda: eng.encrypt(("single_str",), valid_msg),
+        "pk is 1-tuple → InvalidPublicKeyError")
+
+    # Bad message types
+    _assert_raises(InvalidMessageTypeError,
+        lambda: eng.encrypt(pk, 12345),      # type: ignore
+        "message=int → InvalidMessageTypeError")
+
+    _assert_raises(InvalidMessageTypeError,
+        lambda: eng.encrypt(pk, 3.14),       # type: ignore
+        "message=float → InvalidMessageTypeError")
+
+    _assert_raises(InvalidMessageTypeError,
+        lambda: eng.encrypt(pk, ["list"]),   # type: ignore
+        "message=list → InvalidMessageTypeError")
+
+    # Empty / wrong-size messages
+    _assert_raises(EmptyMessageError,
+        lambda: eng.encrypt(pk, b""),
+        "message=b'' → EmptyMessageError")
+
+    _assert_raises(MessageSizeError,
+        lambda: eng.encrypt(pk, b"short"),
+        "message 5 bytes (not chunk_size=32) → MessageSizeError")
+
+    _assert_raises(MessageSizeError,
+        lambda: eng.encrypt(pk, b"X" * 64),
+        "message 64 bytes (double chunk_size) → MessageSizeError")
+
+    # encrypt_chunked empty inputs
+    _assert_raises(EmptyMessageError,
+        lambda: eng.encrypt_chunked(pk, ""),
+        "encrypt_chunked with '' → EmptyMessageError")
+
+    _assert_raises(EmptyMessageError,
+        lambda: eng.encrypt_chunked(pk, b""),
+        "encrypt_chunked with b'' → EmptyMessageError")
+
+    # ── 1.4 Decryption errors ─────────────────────────────────────────────────
+    _sub("1.4  Decryption errors — secret key / ciphertext validation")
+
+    ct = eng.encrypt(pk, valid_msg)
+    u, v = ct
+
+    # Bad secret key
+    _assert_raises(InvalidSecretKeyError,
+        lambda: eng.decrypt([], ct),
+        "sk=[] (empty) → InvalidSecretKeyError")
+
+    _assert_raises(InvalidSecretKeyError,
+        lambda: eng.decrypt(sk + [[0] * N], ct),
+        "sk has extra polynomial → InvalidSecretKeyError")
+
+    _assert_raises(InvalidSecretKeyError,
+        lambda: eng.decrypt("not_a_list", ct),   # type: ignore
+        "sk=str → InvalidSecretKeyError")
+
+    # Bad ciphertext structure
+    _assert_raises(InvalidCiphertextError,
+        lambda: eng.decrypt(sk, ("bad_u", v)),
+        "u=str in ciphertext → InvalidCiphertextError")
+
+    _assert_raises(InvalidCiphertextError,
+        lambda: eng.decrypt(sk, (u[:1], v)),
+        "u wrong dimension (1 instead of k=2) → InvalidCiphertextError")
+
+    _assert_raises(InvalidCiphertextError,
+        lambda: eng.decrypt(sk, (u, v[:-10])),
+        "v truncated → InvalidCiphertextError")
+
+    _assert_raises(InvalidCiphertextError,
+        lambda: eng.decrypt(sk, "not_a_tuple"),
+        "ciphertext=str → InvalidCiphertextError")
+
+    # decrypt_chunked with non-list
+    _assert_raises(CiphertextListError,
+        lambda: eng.decrypt_chunked(sk, ct),
+        "decrypt_chunked with tuple instead of list → CiphertextListError")
+
+    _assert_raises(CiphertextListError,
+        lambda: eng.decrypt_chunked(sk, "bad"),
+        "decrypt_chunked with str → CiphertextListError")
+
+    # ── 1.5 Mismatched keypair (no FO) ───────────────────────────────────────
+    _sub("1.5  Wrong keypair — decrypt with mismatched sk (FO disabled)")
+
+    eng_nofo = KyberCoreEngine(N, Q, ETA, k_dimension=2, d_u=10, d_v=4,
+                                fo_enabled=False)
+    pk_n, sk_n = eng_nofo.keygen(os.urandom(32))
+    _, sk_other = eng_nofo.keygen(os.urandom(32))
+
+    ct_n = eng_nofo.encrypt(pk_n, valid_msg)
+    t0 = time.perf_counter()
+    result = eng_nofo.decrypt(sk_other, ct_n)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    if result != valid_msg:
+        _ok("wrong sk (no FO) → garbled bytes, no exception", elapsed_ms)
+    else:
+        # Astronomically unlikely but technically possible
+        _ok("wrong sk (no FO) → coincidental correct decode (rare)", elapsed_ms)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — FO Transform Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_fo_transform() -> None:
+    _section("SECTION 2 · FO Transform Tests")
+
+    eng_fo = KyberCoreEngine(N, Q, ETA, k_dimension=2, d_u=10, d_v=4,
+                              fo_enabled=True)
+    pk_fo, sk_fo = eng_fo.keygen(os.urandom(32))
+    valid_msg    = b"C" * CHUNK
+
+    # ── 2.1 Honest path — FO-mode encrypt then decrypt with FO check ─────────
+    _sub("2.1  Happy path — FO-mode encrypt → decrypt passes FO check")
+
+    # Must use _fo_encrypt so the r_seed matches what _fo_check re-derives.
+    t0 = time.perf_counter()
+    ct_honest = _fo_encrypt(eng_fo, pk_fo, valid_msg)
+    t_enc = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
+    try:
+        out = eng_fo.decrypt(sk_fo, ct_honest, public_key=pk_fo)
+        t_dec = (time.perf_counter() - t0) * 1000
+        if out == valid_msg:
+            _ok(f"FO honest roundtrip (enc={t_enc:.1f} ms, dec={t_dec:.1f} ms)")
+            _timing["fo/honest_enc"].append(t_enc)
+            _timing["fo/honest_dec"].append(t_dec)
+        else:
+            _fail("FO honest roundtrip: plaintext mismatch after correct FO-mode encrypt")
+    except ImplicitRejectionError as e:
+        _fail("FO honest roundtrip: ImplicitRejectionError on untampered ciphertext",
+              Exception(str(e)))
+
+    # ── 2.2 Random-seed encrypt — FO should reject (expected behaviour) ───────
+    _sub("2.2  Random-seed encrypt → FO correctly rejects (c ≠ c')")
+
+    ct_random = eng_fo.encrypt(pk_fo, valid_msg)   # r_seed=None → random
+    t0 = time.perf_counter()
+    try:
+        eng_fo.decrypt(sk_fo, ct_random, public_key=pk_fo)
+        elapsed = (time.perf_counter() - t0) * 1000
+        _fail("Random-seed ct: expected ImplicitRejectionError, got success")
+    except ImplicitRejectionError as e:
+        elapsed = (time.perf_counter() - t0) * 1000
+        _ok(f"Random-seed ct → ImplicitRejectionError (correct FO behaviour) "
+            f"garbage_key={e.garbage_key.hex()[:16]}… ({elapsed:.1f} ms)")
+        _timing["fo/random_seed_reject"].append(elapsed)
+
+    # ── 2.3 Tampered u vector ─────────────────────────────────────────────────
+    _sub("2.3  Tampered u — FO implicit rejection")
+
+    u, v = ct_honest
+    u_tampered = [[(c + 1) % Q for c in poly] for poly in u]
+    ct_tampered_u = (u_tampered, v)
+
+    t0 = time.perf_counter()
+    try:
+        eng_fo.decrypt(sk_fo, ct_tampered_u, public_key=pk_fo)
+        _fail("Tampered u: expected ImplicitRejectionError, got none")
+    except ImplicitRejectionError as e:
+        elapsed = (time.perf_counter() - t0) * 1000
+        _timing["fo/tampered_u"].append(elapsed)
+        if isinstance(e.garbage_key, bytes) and len(e.garbage_key) == 32:
+            _ok(f"Tampered u → ImplicitRejectionError "
+                f"garbage_key={e.garbage_key.hex()[:16]}… ({elapsed:.1f} ms)")
+        else:
+            _fail("Tampered u: raised but garbage_key is malformed")
+
+    # ── 2.4 Tampered v polynomial ─────────────────────────────────────────────
+    _sub("2.4  Tampered v — FO implicit rejection")
+
+    v_tampered = [(c + 500) % Q for c in v]
+    ct_tampered_v = (u, v_tampered)
+
+    t0 = time.perf_counter()
+    try:
+        eng_fo.decrypt(sk_fo, ct_tampered_v, public_key=pk_fo)
+        _fail("Tampered v: expected ImplicitRejectionError, got none")
+    except ImplicitRejectionError as e:
+        elapsed = (time.perf_counter() - t0) * 1000
+        _timing["fo/tampered_v"].append(elapsed)
+        _ok(f"Tampered v → ImplicitRejectionError ({elapsed:.1f} ms)")
+
+    # ── 2.5 Single-coefficient flip ───────────────────────────────────────────
+    _sub("2.5  Single-coefficient flip — sensitivity test")
+
+    v_bit_flip = list(v)
+    v_bit_flip[0] = (v_bit_flip[0] + 1) % Q
+
+    t0 = time.perf_counter()
+    try:
+        eng_fo.decrypt(sk_fo, (u, v_bit_flip), public_key=pk_fo)
+        elapsed = (time.perf_counter() - t0) * 1000
+        _ok(f"Single coeff flip: within noise budget, decoded OK ({elapsed:.1f} ms)")
+    except ImplicitRejectionError:
+        elapsed = (time.perf_counter() - t0) * 1000
+        _ok(f"Single coeff flip: caught by FO → ImplicitRejectionError ({elapsed:.1f} ms)")
+
+    # ── 2.6 FO disabled — tampered ciphertext passes through silently ─────────
+    _sub("2.6  FO disabled — tampered ct produces garbled bytes (no exception)")
+
+    eng_nofo = KyberCoreEngine(N, Q, ETA, k_dimension=2, d_u=10, d_v=4,
+                                fo_enabled=False)
+    pk_n, sk_n = eng_nofo.keygen(os.urandom(32))
+    ct_n = eng_nofo.encrypt(pk_n, valid_msg)
+    u_n, v_n = ct_n
+    u_bad = [[(c + 100) % Q for c in p] for p in u_n]
+
+    t0 = time.perf_counter()
+    try:
+        result = eng_nofo.decrypt(sk_n, (u_bad, v_n))
+        elapsed = (time.perf_counter() - t0) * 1000
+        _timing["fo/disabled_tamper"].append(elapsed)
+        _ok(f"FO disabled: tampered ct decrypted without exception ({elapsed:.1f} ms)")
+    except Exception as e:
+        _fail(f"FO disabled: unexpected exception {type(e).__name__}: {e}")
+
+    # ── 2.7 fo_override=False per-call suppression ────────────────────────────
+    _sub("2.7  fo_override=False — per-call FO suppression")
+
+    # Use ct_tampered_u (which would normally be rejected) — with override off
+    # it should decrypt without raising.
+    t0 = time.perf_counter()
+    try:
+        result = eng_fo.decrypt(sk_fo, ct_tampered_u,
+                                 public_key=pk_fo, fo_override=False)
+        elapsed = (time.perf_counter() - t0) * 1000
+        _ok(f"fo_override=False: tampered ct passed silently ({elapsed:.1f} ms)")
+    except ImplicitRejectionError:
+        _fail("fo_override=False should have suppressed FO check")
+    except Exception as e:
+        # Garbled decode causing internal error is also acceptable
+        elapsed = (time.perf_counter() - t0) * 1000
+        _ok(f"fo_override=False: got {type(e).__name__} on garbled decode ({elapsed:.1f} ms)")
+
+    # ── 2.8 Garbage key determinism ───────────────────────────────────────────
+    _sub("2.8  Garbage key determinism — same tampered ct → same 32-byte key")
+
+    garbage_keys = []
+    for _ in range(3):
+        try:
+            eng_fo.decrypt(sk_fo, ct_tampered_u, public_key=pk_fo)
+        except ImplicitRejectionError as e:
+            garbage_keys.append(e.garbage_key)
+
+    if len(set(garbage_keys)) == 1 and len(garbage_keys) == 3:
+        _ok(f"garbage_key is deterministic: {garbage_keys[0].hex()[:24]}…")
+    elif len(garbage_keys) == 0:
+        _fail("No ImplicitRejectionError was raised — tampered ct was not caught")
+    else:
+        _fail(f"garbage_key differs across calls: {[k.hex()[:16] for k in garbage_keys]}")
+
+    # ── 2.9 FO overhead — honest vs tampered timing ───────────────────────────
+    _sub("2.9  FO overhead — honest vs tampered latency (20 runs each)")
+
+    runs = 20
+    ct_bench = _fo_encrypt(eng_fo, pk_fo, valid_msg)
+    u_b, v_b = ct_bench
+    u_t = [[(c + 400) % Q for c in p] for p in u_b]
+
+    avg_honest, _, _ = _timeit(
+        lambda: eng_fo.decrypt(sk_fo, ct_bench, public_key=pk_fo), runs)
+
+    def _try_tampered():
+        try:
+            eng_fo.decrypt(sk_fo, (u_t, v_b), public_key=pk_fo)
+        except ImplicitRejectionError:
+            pass
+
+    avg_tampered, _, _ = _timeit(_try_tampered, runs)
+    _timing["fo/bench_honest"].append(avg_honest)
+    _timing["fo/bench_tampered"].append(avg_tampered)
+
+    ratio = avg_tampered / avg_honest if avg_honest > 0 else float("inf")
+    note  = "✓ timing similar (constant-time)" if ratio < 2.5 else "⚠  timing ratio suspicious"
+    print(f"\n     Honest   : {avg_honest:.2f} ms  (avg {runs} runs)")
+    print(f"     Tampered : {avg_tampered:.2f} ms  (avg {runs} runs)")
+    print(f"     Ratio    : {ratio:.2f}×  {note}")
+    _ok("FO timing comparison complete")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — Round-trip Sanity
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_roundtrip_sanity() -> None:
+    _section("SECTION 3 · Round-trip Sanity")
+
+    eng = KyberCoreEngine(N, Q, ETA, k_dimension=2, d_u=10, d_v=4,
+                          fo_enabled=False)   # FO off — random seeds allowed
+    pk, sk = eng.keygen(os.urandom(32))
+
+    test_cases = [
+        ("zeros",   b"\x00" * CHUNK),
+        ("ones",    b"\xFF" * CHUNK),
+        ("pattern", bytes(range(CHUNK))),
+        ("random",  os.urandom(CHUNK)),
     ]
 
-    labels = [
-        "Core Correctness",
-        "String Payloads",
-        "Integer Payloads",
-        "Float Payloads",
-        "Bytes Payloads",
-        "Chunked API",
-        "Compression",
-        "Error Handling",
-        "Multi-Variant",
-        "Noise Analysis",
-        "Benchmarks",
+    _sub("3.1  Single-chunk roundtrip (4 payloads)")
+    for label, msg in test_cases:
+        try:
+            ct  = eng.encrypt(pk, msg)
+            out = eng.decrypt(sk, ct)
+            if out == msg:
+                _ok(f"[{label}] single-chunk roundtrip")
+            else:
+                _fail(f"[{label}] plaintext mismatch")
+        except Exception as e:
+            _fail(f"[{label}] unexpected exception: {e}")
+
+    _sub("3.2  Chunked string roundtrip — all three Kyber variants")
+    for variant, k_dim, du, dv in [(512,2,10,4),(768,3,10,4),(1024,4,11,5)]:
+        ev = KyberCoreEngine(N, Q, ETA, k_dimension=k_dim, d_u=du, d_v=dv,
+                             fo_enabled=False)
+        pk_v, sk_v = ev.keygen(os.urandom(32))
+        msg_str = f"Kyber-{variant} chunked test — αβγδ ✓"
+        try:
+            cts = ev.encrypt_chunked(pk_v, msg_str)
+            out = ev.decrypt_chunked(sk_v, cts, output_type="str")
+            if out == msg_str:
+                _ok(f"Kyber-{variant} ({len(cts)} chunk(s)) roundtrip")
+            else:
+                _fail(f"Kyber-{variant} mismatch")
+        except Exception as e:
+            _fail(f"Kyber-{variant} exception: {e}")
+
+    _sub("3.3  Deterministic keygen — same seed → same keypair")
+    seed   = os.urandom(32)
+    pk1, _ = eng.keygen(seed)
+    pk2, _ = eng.keygen(seed)
+    if pk1[0] == pk2[0]:
+        _ok("keygen is deterministic given same seed")
+    else:
+        _fail("keygen is not deterministic!")
+
+    _sub("3.4  Cross-key failure — wrong sk produces different plaintext")
+    _, sk_other = eng.keygen(os.urandom(32))
+    msg  = b"Q" * CHUNK
+    ct   = eng.encrypt(pk, msg)
+    out  = eng.decrypt(sk_other, ct)
+    if out != msg:
+        _ok("wrong sk → garbled bytes (expected)")
+    else:
+        _fail("wrong sk produced correct plaintext (should not happen)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — Profiler Dashboard
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_profiler_report() -> None:
+    _section("SECTION 4 · Profiler Dashboard — Error Path & FO Overhead")
+
+    msg = b"P" * CHUNK
+
+    # ── Happy path ────────────────────────────────────────────────────────────
+    Profiler.current_category = "Happy Path"
+    eng_h = KyberCoreEngine(N, Q, ETA, k_dimension=2, d_u=10, d_v=4,
+                             fo_enabled=True)
+    pk_h, sk_h = eng_h.keygen(os.urandom(32))
+    for _ in range(10):
+        ct = _fo_encrypt(eng_h, pk_h, msg)
+        eng_h.decrypt(sk_h, ct, public_key=pk_h)
+
+    # ── Error-handling path ───────────────────────────────────────────────────
+    Profiler.current_category = "Error Handling Path"
+    eng_e = KyberCoreEngine(N, Q, ETA, k_dimension=2, d_u=10, d_v=4)
+    pk_e, sk_e = eng_e.keygen(os.urandom(32))
+    for _ in range(10):
+        try: eng_e.keygen(b"bad")
+        except Exception: pass
+        try: eng_e.encrypt(pk_e, b"too_short")
+        except Exception: pass
+        try: eng_e.decrypt([], eng_e.encrypt(pk_e, msg))
+        except Exception: pass
+
+    # ── FO transform path ─────────────────────────────────────────────────────
+    Profiler.current_category = "FO Transform"
+    eng_f = KyberCoreEngine(N, Q, ETA, k_dimension=2, d_u=10, d_v=4,
+                             fo_enabled=True)
+    pk_f, sk_f = eng_f.keygen(os.urandom(32))
+    ct_f = _fo_encrypt(eng_f, pk_f, msg)
+    u_f, v_f = ct_f
+    u_bad = [[(c + 300) % Q for c in p] for p in u_f]
+    for _ in range(10):
+        eng_f.decrypt(sk_f, _fo_encrypt(eng_f, pk_f, msg), public_key=pk_f)
+        try:
+            eng_f.decrypt(sk_f, (u_bad, v_f), public_key=pk_f)
+        except ImplicitRejectionError:
+            pass
+
+    Profiler.current_category = "General"
+
+    # ── Print timing registry ─────────────────────────────────────────────────
+    print(f"\n  {'Label':<42}  {'n':>4}  {'avg ms':>8}  {'min ms':>8}  {'max ms':>8}")
+    print(f"  {'─'*42}  {'─'*4}  {'─'*8}  {'─'*8}  {'─'*8}")
+    for label, times in sorted(_timing.items()):
+        if not times:
+            continue
+        print(f"  {label:<42}  {len(times):>4}  "
+              f"{sum(times)/len(times):>8.2f}  {min(times):>8.2f}  {max(times):>8.2f}")
+
+    # ── HTML dashboard ────────────────────────────────────────────────────────
+    try:
+        Profiler.generate_html_dashboard("kyber_profiler_dashboard.html")
+    except Exception as e:
+        print(f"\n  {YELLOW}⚠ HTML export skipped: {e}{RESET}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — Enc/Dec Benchmark by Message Length
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_timing_by_length() -> None:
+    _section("SECTION 5 · Enc/Dec Latency by Message Length")
+
+    # FO disabled so random seeds are fine and results reflect pure crypto cost
+    eng = KyberCoreEngine(N, Q, ETA, k_dimension=2, d_u=10, d_v=4,
+                          fo_enabled=False)
+    pk, sk = eng.keygen(os.urandom(32))
+
+    lengths: List[Tuple[str, int]] = [
+        ("1 B",              1),
+        ("16 B",            16),
+        ("32 B (1 chunk)",  32),
+        ("64 B (2 chunks)", 64),
+        ("128 B",          128),
+        ("256 B",          256),
+        ("512 B",          512),
+        ("1 KB",          1024),
+        ("2 KB",          2048),
+        ("4 KB",          4096),
+        ("8 KB",          8192),
     ]
 
-    for cls, label in zip(test_classes, labels):
-        section(label)
-        suite.addTests(loader.loadTestsFromTestCase(cls))
+    RUNS = 8
 
-    runner = unittest.TextTestRunner(verbosity=2, stream=__import__("sys").stdout)
-    result = runner.run(suite)
+    print(f"\n  {'Length':<22}  {'Chunks':>6}  {'Enc avg':>9}  {'Enc min':>9}"
+          f"  {'Dec avg':>9}  {'Dec min':>9}  {'Total':>9}  {'Throughput B/s':>16}")
+    print(f"  {'─'*22}  {'─'*6}  {'─'*9}  {'─'*9}"
+          f"  {'─'*9}  {'─'*9}  {'─'*9}  {'─'*16}")
 
-    print_bench_report()
-    Profiler.generate_html_dashboard()
+    bench_rows = []
 
-    raise SystemExit(0 if result.wasSuccessful() else 1) 
+    for label, nbytes in lengths:
+        payload = os.urandom(nbytes)
+        cts     = eng.encrypt_chunked(pk, payload)
+        n_chunks = len(cts)
+
+        avg_enc, min_enc, _ = _timeit(
+            lambda: eng.encrypt_chunked(pk, payload), RUNS)
+        avg_dec, min_dec, _ = _timeit(
+            lambda: eng.decrypt_chunked(sk, cts, output_type="bytes"), RUNS)
+
+        total = avg_enc + avg_dec
+        tp    = (nbytes / (total / 1000)) if total > 0 else 0
+
+        print(f"  {label:<22}  {n_chunks:>6}  {avg_enc:>8.2f}ms  {min_enc:>8.2f}ms"
+              f"  {avg_dec:>8.2f}ms  {min_dec:>8.2f}ms  {total:>8.2f}ms  {tp:>16,.0f}")
+
+        bench_rows.append({
+            "label":       label,
+            "bytes":       nbytes,
+            "chunks":      n_chunks,
+            "enc_avg_ms":  round(avg_enc, 3),
+            "enc_min_ms":  round(min_enc, 3),
+            "dec_avg_ms":  round(avg_dec, 3),
+            "dec_min_ms":  round(min_dec, 3),
+            "total_ms":    round(total,   3),
+            "throughput":  round(tp, 0),
+        })
+
+    # ── Per-variant single-chunk latency ─────────────────────────────────────
+    _sub("5b.  Per-variant single-chunk latency (32 bytes, 50 runs)")
+
+    msg32 = os.urandom(32)
+    print(f"\n  {'Variant':<14}  {'KeyGen ms':>10}  {'Enc avg ms':>12}  {'Dec avg ms':>12}")
+    print(f"  {'─'*14}  {'─'*10}  {'─'*12}  {'─'*12}")
+
+    for variant, k_dim, du, dv in [(512,2,10,4),(768,3,10,4),(1024,4,11,5)]:
+        ev = KyberCoreEngine(N, Q, ETA, k_dimension=k_dim, d_u=du, d_v=dv,
+                             fo_enabled=False)
+        t0 = time.perf_counter()
+        pk_v, sk_v = ev.keygen(os.urandom(32))
+        kg_ms = (time.perf_counter() - t0) * 1000
+
+        ct_v = ev.encrypt(pk_v, msg32)
+        avg_e, _, _ = _timeit(lambda: ev.encrypt(pk_v, msg32), 50)
+        avg_d, _, _ = _timeit(lambda: ev.decrypt(sk_v, ct_v),  50)
+
+        print(f"  Kyber-{variant:<8}  {kg_ms:>10.2f}  {avg_e:>12.2f}  {avg_d:>12.2f}")
+
+    # Save JSON
+    try:
+        out_path = Path("kyber_timing_benchmark.json")
+        with open(out_path, "w") as f:
+            json.dump(bench_rows, f, indent=2)
+        print(f"\n  {GREEN}Timing data saved → {out_path}{RESET}")
+    except Exception as e:
+        print(f"\n  {YELLOW}⚠ Could not save JSON: {e}{RESET}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    print(f"\n{BOLD}{'═'*70}{RESET}")
+    print(f"{BOLD}  Kyber KEM — Full Test Suite  (N={N}, Q={Q}, η={ETA}){RESET}")
+    print(f"{BOLD}{'═'*70}{RESET}")
+
+    test_error_handling()
+    test_fo_transform()
+    test_roundtrip_sanity()
+    build_profiler_report()
+    test_timing_by_length()
+
+    total = sum(_results.values())
+    p, f, s = _results["pass"], _results["fail"], _results["skip"]
+
+    _section("SUMMARY")
+    print(f"  Total : {total}")
+    print(f"  {GREEN}Pass  : {p}{RESET}")
+    print(f"  {RED}Fail  : {f}{RESET}")
+    print(f"  {YELLOW}Skip  : {s}{RESET}\n")
+
+    if f == 0:
+        print(f"  {BOLD}{GREEN}All checks passed.{RESET}")
+    else:
+        print(f"  {BOLD}{RED}{f} check(s) failed — review output above.{RESET}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

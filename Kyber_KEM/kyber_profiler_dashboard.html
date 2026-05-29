@@ -1,0 +1,38 @@
+
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Kyber Hardware Pipeline Benchmarks</title>
+            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+            <style>
+                body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; padding: 2rem; }
+                .container { max-width: 1200px; margin: 0 auto; background: #1e293b; padding: 2rem; border-radius: 12px; }
+                h1 { text-align: center; color: #38bdf8; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Kyber KEM Execution Profiler</h1>
+                <p style="text-align: center;">Absolute Time (ms) per Category Breakdown</p>
+                <canvas id="benchmarkChart"></canvas>
+            </div>
+            <script>
+                const ctx = document.getElementById('benchmarkChart').getContext('2d');
+                new Chart(ctx, {
+                    type: 'bar',
+                    data: {"labels": ["General", "Happy Path", "Error Handling Path", "FO Transform"], "datasets": [{"label": "decoder poly to msg (hard)", "data": [4.973, 0.84, 0.0, 1.4], "backgroundColor": "#3b82f6"}, {"label": "encoder msg to poly", "data": [3.064, 0.808, 0.187, 1.217], "backgroundColor": "#ef4444"}, {"label": "Keccak PRF shake 256", "data": [2.037, 0.554, 0.154, 0.638], "backgroundColor": "#10b981"}, {"label": "Forward NTT", "data": [129.617, 27.406, 6.86, 36.934], "backgroundColor": "#f59e0b"}, {"label": "Inverse NTT", "data": [123.67, 30.598, 9.38, 41.39], "backgroundColor": "#8b5cf6"}, {"label": "Keccak XOF shake 128", "data": [0.805, 0.057, 0.036, 0.024], "backgroundColor": "#ec4899"}, {"label": "Multiplication NTT", "data": [33.245, 7.954, 2.467, 10.851], "backgroundColor": "#14b8a6"}]},
+                    options: {
+                        responsive: true,
+                        scales: {
+                            x: { stacked: true },
+                            y: { stacked: true, title: { display: true, text: 'Total Time (ms)' } }
+                        },
+                        plugins: {
+                            tooltip: { mode: 'index', intersect: false }
+                        }
+                    }
+                });
+            </script>
+        </body>
+        </html>
+        

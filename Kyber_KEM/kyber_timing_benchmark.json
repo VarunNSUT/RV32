@@ -1,0 +1,123 @@
+[
+  {
+    "label": "1 B",
+    "bytes": 1,
+    "chunks": 1,
+    "enc_avg_ms": 4.222,
+    "enc_min_ms": 3.557,
+    "dec_avg_ms": 2.504,
+    "dec_min_ms": 2.185,
+    "total_ms": 6.727,
+    "throughput": 149.0
+  },
+  {
+    "label": "16 B",
+    "bytes": 16,
+    "chunks": 1,
+    "enc_avg_ms": 6.134,
+    "enc_min_ms": 3.32,
+    "dec_avg_ms": 5.291,
+    "dec_min_ms": 2.783,
+    "total_ms": 11.425,
+    "throughput": 1400.0
+  },
+  {
+    "label": "32 B (1 chunk)",
+    "bytes": 32,
+    "chunks": 2,
+    "enc_avg_ms": 13.659,
+    "enc_min_ms": 8.119,
+    "dec_avg_ms": 6.332,
+    "dec_min_ms": 4.564,
+    "total_ms": 19.991,
+    "throughput": 1601.0
+  },
+  {
+    "label": "64 B (2 chunks)",
+    "bytes": 64,
+    "chunks": 3,
+    "enc_avg_ms": 12.475,
+    "enc_min_ms": 9.667,
+    "dec_avg_ms": 6.703,
+    "dec_min_ms": 5.722,
+    "total_ms": 19.178,
+    "throughput": 3337.0
+  },
+  {
+    "label": "128 B",
+    "bytes": 128,
+    "chunks": 5,
+    "enc_avg_ms": 32.88,
+    "enc_min_ms": 17.157,
+    "dec_avg_ms": 21.634,
+    "dec_min_ms": 9.736,
+    "total_ms": 54.514,
+    "throughput": 2348.0
+  },
+  {
+    "label": "256 B",
+    "bytes": 256,
+    "chunks": 9,
+    "enc_avg_ms": 65.129,
+    "enc_min_ms": 51.467,
+    "dec_avg_ms": 26.464,
+    "dec_min_ms": 17.519,
+    "total_ms": 91.593,
+    "throughput": 2795.0
+  },
+  {
+    "label": "512 B",
+    "bytes": 512,
+    "chunks": 17,
+    "enc_avg_ms": 114.722,
+    "enc_min_ms": 92.236,
+    "dec_avg_ms": 58.597,
+    "dec_min_ms": 33.574,
+    "total_ms": 173.319,
+    "throughput": 2954.0
+  },
+  {
+    "label": "1 KB",
+    "bytes": 1024,
+    "chunks": 33,
+    "enc_avg_ms": 194.038,
+    "enc_min_ms": 143.435,
+    "dec_avg_ms": 106.326,
+    "dec_min_ms": 77.845,
+    "total_ms": 300.363,
+    "throughput": 3409.0
+  },
+  {
+    "label": "2 KB",
+    "bytes": 2048,
+    "chunks": 65,
+    "enc_avg_ms": 402.083,
+    "enc_min_ms": 345.085,
+    "dec_avg_ms": 200.129,
+    "dec_min_ms": 153.917,
+    "total_ms": 602.212,
+    "throughput": 3401.0
+  },
+  {
+    "label": "4 KB",
+    "bytes": 4096,
+    "chunks": 129,
+    "enc_avg_ms": 582.026,
+    "enc_min_ms": 533.631,
+    "dec_avg_ms": 355.275,
+    "dec_min_ms": 287.856,
+    "total_ms": 937.301,
+    "throughput": 4370.0
+  },
+  {
+    "label": "8 KB",
+    "bytes": 8192,
+    "chunks": 257,
+    "enc_avg_ms": 1154.228,
+    "enc_min_ms": 976.129,
+    "dec_avg_ms": 698.406,
+    "dec_min_ms": 646.157,
+    "total_ms": 1852.633,
+    "throughput": 4422.0
+  }
+]

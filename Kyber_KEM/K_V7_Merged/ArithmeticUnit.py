@@ -135,3 +135,27 @@ class ArithmeticUnit:
         if r > self.Q // 2:
             r -= self.Q
         return r
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
